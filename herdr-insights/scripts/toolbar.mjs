@@ -67,7 +67,7 @@ export function withInsightsToolbar(layout) {
   if (nodes.some((node) => node.id === BUTTON_ID || node.id === "insights-original-tabs")) {
     throw new Error("This layout already contains Insights toolbar blocks.");
   }
-  const matches = nodes.filter((node) => node.id === "tabs" && node.type === "block" && node.content?.mod === "tabs");
+  const matches = nodes.filter((node) => node.id === "tabs" && node.type === "block" && ["tabs", "annotator-tabs"].includes(node.content?.mod));
   if (matches.length !== 1) {
     throw new Error('Expected one native "tabs" block. This layout cannot be integrated safely.');
   }

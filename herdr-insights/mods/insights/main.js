@@ -1,4 +1,4 @@
-// Insights: a native, local-only usage dashboard. No DOM, no shell, no stored cx.
+// Insights: local usage analytics with optional provider-reported subscription quotas.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Button, Input, InputState, Editor, EditorState, Popover } from "gpui-base";
 import { exec, appHome, home, theme, settings, nextCommand, panes, props, run, readTextFile, spaces } from "herdr";
@@ -449,6 +449,10 @@ export default class Insights extends View {
     if (this.toolbarMode) return;
 
     this.snapshot = null;
+    this.quotas = null;
+    this.quotaTask = null;
+    this.quotaBusy = false;
+    this.quotaError = null;
     this.loading = false;
     this.error = null;
     this.width = 960;
@@ -545,6 +549,7 @@ export default class Insights extends View {
     this.closed = true;
     if (this.toolbarMode) return;
     this.cancelDashboardWork();
+    try { this.quotaTask?.cancel(); } catch { /* already gone */ }
     this.activityGeneration = (this.activityGeneration ?? 0) + 1;
     try { this.activityTask?.cancel(); } catch { /* already gone */ }
     this.activityTask = null;
@@ -1002,6 +1007,7 @@ export default class Insights extends View {
       this.resolveRuntime(cx);
       return;
     }
+    this.quotaAction("refresh", cx);
     if (this.busy()) return;
     this.cancelScanContinue();
     const generation = (this.activityGeneration ?? 0) + 1;
@@ -1407,6 +1413,7 @@ export default class Insights extends View {
     const width = this.width || 960;
     const padding = width < 620 ? G.md : width < 900 ? G.lg : G.xl;
     const content = [this.header(c)];
+    if (!this.showSettings) content.push(this.quotaCard(c));
     if (this.error && this.snapshot) content.push(this.errorBanner(c));
     if (this.dashboardError && this.snapshot) content.push(this.dashboardErrorBanner(c));
     if (!this.snapshot) content.push(this.initialState(c));
@@ -1475,6 +1482,63 @@ export default class Insights extends View {
           c,
           { variant: "outline" },
         ))));
+  }
+
+  quotaAction(action, cx) {
+    if (this.closed || !this.nodeBinary || this.quotaBusy) return;
+    this.quotaBusy = true;
+    this.quotaError = null;
+    this.quotaTask = cx.spawn(async (quotaCx) => {
+      try {
+        const result = await exec(this.nodeBinary, [
+          `${appHome()}/mods/insights/quotas.mjs`, action,
+          "--store", `${appHome()}/data/insights`,
+        ]);
+        if (result.code !== 0) throw new Error(resultError(result));
+        const data = JSON.parse(result.stdout);
+        if (!data.codex || !data.claude) throw new Error("Invalid quota response");
+        if (!this.closed) this.quotas = data;
+      } catch (error) {
+        if (!this.closed) this.quotaError = sanitizeError(error);
+      } finally {
+        if (!this.closed) {
+          this.quotaBusy = false;
+          this.quotaTask = null;
+          quotaCx.notify();
+        }
+      }
+    });
+    cx.notify();
+  }
+
+  quotaCard(c) {
+    const view = card(c).child(cardHeader("Subscription quotas", "Opt-in · provider-reported allowances, not token estimates or API billing", c));
+    if (this.quotaError) view.child(bodyText(this.quotaError, c));
+    for (const [id, label] of [["codex", "Codex / ChatGPT"], ["claude", "Claude Code"]]) {
+      const quota = this.quotas?.[id];
+      const enabled = quota?.enabled === true;
+      const status = this.quotaBusy ? "Updating…" : quota?.status ?? "Disabled";
+      const section = v_flex().gap(G.xs)
+        .child(h_flex().w_full().flex_wrap().items_center().justify_between().gap(G.sm)
+          .child(bodyText(`${label} · ${status}`, c))
+          .child(button(`quota-${id}`, enabled ? "Disconnect" : `Connect ${id === "codex" ? "Codex" : "Claude"}`,
+            (_event, clickCx) => this.quotaAction(`${enabled ? "disable" : "enable"}-${id}`, clickCx), c,
+            { variant: "outline", disabled: this.quotaBusy || !this.nodeBinary })));
+      for (const w of quota?.windows ?? []) {
+        const reset = w.resetsAt ? ` · ${w.expired ? "reset passed" : "resets"} ${formatTimestamp(w.resetsAt)}` : " · reset unknown";
+        section.child(bodyText(`${w.label}: ${w.usedPercent}% used · ${w.remainingPercent}% remaining${reset}`, c));
+      }
+      if (enabled && quota?.updatedAt) section.child(mutedText(`Last reported ${formatTimestamp(quota.updatedAt)}`, c));
+      if (enabled && quota?.error) section.child(mutedText(quota.error, c));
+      if (!enabled || !quota?.windows?.length) section.child(mutedText(id === "codex"
+        ? "Connect queries your signed-in Codex account over the network. No prompts or inference requests."
+        : "Connect adds a backed-up Claude status-line hook, preserving your existing command. Restart Claude Code, then use it to report quotas.", c));
+      view.child(section);
+    }
+    return view.child(h_flex().gap(G.sm).items_center()
+      .child(button("quota-refresh", "Refresh quotas", (_event, clickCx) => this.quotaAction("refresh", clickCx), c,
+        { variant: "outline", disabled: this.quotaBusy || !this.nodeBinary }))
+      .child(mutedText("Stale after 5 minutes, a passed reset, or a failed query. Missing data is never treated as zero.", c)));
   }
 
   errorBanner(c) {
